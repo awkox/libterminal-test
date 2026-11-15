@@ -1,0 +1,91 @@
+name: 编译
+
+on:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  # 同类事件同 ref 的最新 run 优先，取消旧 run；push 与 PR 分属不同组，
+  # 避免 PR 事件后来居上把正在上传 release 的 push 构建取消掉
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      # secrets 不能出现在 if 条件中，先解析为 job 级环境变量布尔值
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_GZ_B64 != '' }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: 配置 Gradle（依赖/构建缓存）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # PR 只读缓存：避免未合并分支污染共享构建缓存
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: 解密KeyStore
+        # 无 secrets（如 fork 分支 push）跳过：release 不构建，只出 debug
+        if: github.event_name != 'pull_request' && env.HAS_KEYSTORE == 'true'
+        run: |
+          echo "${{ secrets.KEYSTORE_GZ_B64 }}" \
+            | base64 --decode \
+            | gunzip > app/release.keystore
+          ACTUAL_SHA=$(sha256sum app/release.keystore | awk '{print $1}')
+          EXPECTED_SHA=${{ secrets.KEYSTORE_EXPECTED_SHA256 }}
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+              exit 1
+          fi
+
+      - name: 单元测试
+        # 在编译前拦截回归：测试失败即中止，不浪费后续构建
+        run: ./gradlew --build-cache :libterminal:testDebugUnitTest
+
+      - name: 上传测试报告
+        # 仅测试失败时上传，便于离线排查
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: libterminal-test-report
+          path: libterminal/build/test-results/testDebugUnitTest
+
+      - name: 编译
+        env:
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          ./gradlew --build-cache :app:assembleDebug
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "$HAS_KEYSTORE" = "true" ]; then
+            ./gradlew --build-cache :app:assembleRelease
+          fi
+
+      - name: 上传 Debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: app-debug.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 上传 Release APK
+        # 仅在有 keystore 时才有产物
+        if: github.event_name != 'pull_request' && env.HAS_KEYSTORE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: app/build/outputs/apk/release/app-release.apk

@@ -1,11 +1,65 @@
-<div align="center">
+[![GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Kotlin](https://img.shields.io/badge/Kotlin-2.4.21-purple.svg)](https://kotlinlang.org)
+[![Platform: Android](https://img.shields.io/badge/Platform-Android-green.svg)](https://developer.android.com)
+[![minSdk](https://img.shields.io/badge/minSdk-28-orange.svg)](https://developer.android.com/studio)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/awkox/AndroidTerminal/ci.yml?label=编译&logo=github)](.github/workflows/ci.yml)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.awkox/libterminal?logo=apachemaven&logoColor=white&label=Maven%20Central&color=blue)](https://search.maven.org/artifact/io.github.awkox/libterminal)
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 
-  <h1>Built with AI Studio</h2>
+# AndroidTerminal
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+一个基于 Termux 使用 Kotlin + Compose 重写的高性能 Android 终端
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## 特性
 
-</div>
+- （待完善）
+
+## libterminal集成
+
+参见 [集成文档](docs/libterminal-integration.md)
+
+## 编译
+
+环境要求：
+
+- JDK 21
+- Android SDK（compileSdk 37、targetSdk 28）
+- Android NDK 29.0.14206865
+
+debug 版本：
+
+```bash
+./gradlew assembleDebug
+```
+
+release 版本需要环境变量 `KEYSTORE_PASS`、`KEY_ALIAS`、`KEY_PASS` 指向 `app/release.keystore`：
+
+```bash
+./gradlew assembleRelease
+```
+
+## 项目结构
+
+```
+.
+├── app/                # Demo 应用
+│   ├── core/           # 会话管理、SSH 信任策略、私钥导入与连接记录持久化
+│   ├── extrakeys/      # 扩展按键栏
+│   └── ui/             # Compose 界面（会话列表、终端视图、设置）
+├── libterminal/        # 终端模拟核心库
+│   ├── color/          # 颜色方案与稀疏调色板
+│   ├── engine/         # VT100/xterm 模拟器、ANSI 解析、会话
+│   ├── process/        # 终端进程抽象接口
+│   ├── text/           # 文本宽度、UTF-8 解码
+│   └── view/           # Canvas 渲染 View、文本选择、输入处理
+├── libterminal-pty/    # 本地 PTY 进程模块（C++/JNI 原生实现 + Kotlin 封装）
+└── libterminal-ssh/    # SSH 终端模块（libssh + mbedtls，服务端指纹探测与连接）
+```
+
+## 贡献
+
+欢迎通过 GitHub Issues 提交问题与建议，或通过 Pull Request 贡献代码
+
+## 许可证
+
+本项目基于 [GNU GPL v3](LICENSE) 开源，详见 LICENSE 文件。

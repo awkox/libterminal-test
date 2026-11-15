@@ -1,0 +1,182 @@
+package com.awkoo.libterminal.view.input
+
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.widget.Scroller
+import com.awkoo.libterminal.engine.TerminalEmulator
+import com.awkoo.libterminal.engine.buffer.CursorCoord
+import com.awkoo.libterminal.view.TerminalView
+import kotlin.math.abs
+
+/**
+ * 终端触摸、鼠标和滚动输入处理器。
+ *
+ * 持有 [GestureAndScaleRecognizer]、[Scroller] 以及所有鼠标/触控板状态。
+ * 触摸事件转发给手势识别器；鼠标事件可被翻译为终端鼠标追踪序列或滚动操作。
+ */
+internal class TerminalTouchHandler(
+    private val view: TerminalView
+) {
+    val gestureRecognizer: GestureAndScaleRecognizer
+    val scroller: Scroller = Scroller(view.context)
+
+    private var scrollRemainder: Float = 0f
+    var scaleFactor: Float = 1f
+
+    /** 鼠标滚动状态 — 报告给终端鼠标追踪的坐标。 */
+    private var mouseScrollStartX = -1
+    private var mouseScrollStartY = -1
+
+    /** 启动当前鼠标滚动序列的触摸事件时间戳。 */
+    private var mouseStartDownTime: Long = -1
+
+    init {
+        gestureRecognizer = GestureAndScaleRecognizer(
+            view.context,
+            TerminalGestureListener(view)
+        )
+    }
+
+    fun onTouchEvent(event: MotionEvent): Boolean {
+        val emulator = view.emulator ?: return true
+
+        if (view.isSelectingText) {
+            view.updateFloatingToolbarVisibility(event)
+            gestureRecognizer.onTouchEvent(event)
+            return true
+        }
+
+        if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            if (handleMouseEvent(emulator, event)) return true
+        }
+
+        gestureRecognizer.onTouchEvent(event)
+        return true
+    }
+
+    fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        val emulator = view.emulator ?: return false
+        if (!event.isFromSource(InputDevice.SOURCE_MOUSE)) return false
+        return when (event.action) {
+            MotionEvent.ACTION_SCROLL -> {
+                val up = event.getAxisValue(MotionEvent.AXIS_VSCROLL) > 0.0f
+                scrollBy(if (up) -3 else 3, event.downTime, event.x, event.y)
+                true
+            }
+            // 1003 任意事件模式：无按钮的悬停移动也上报（悬停事件仅经此通道投递）
+            MotionEvent.ACTION_HOVER_MOVE if emulator.isMouseAnyEventTrackingActive -> {
+                sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true)
+                true
+            }
+            else -> false
+        }
+    }
+
+    // 供外部重置滚动余数
+    fun resetScrollRemainder() {
+        scrollRemainder = 0f
+    }
+
+    // 接管外部传递进来的平滑滚动事件并处理余数
+    fun handleScrollEvent(event: MotionEvent, dy: Float) {
+        val distanceY = dy + scrollRemainder
+        val deltaRows = (distanceY / view.renderer.fontLineSpacing).toInt()
+        scrollRemainder = distanceY - deltaRows * view.renderer.fontLineSpacing
+        scrollBy(deltaRows, event.downTime, event.x, event.y)
+    }
+
+    /**
+     * 执行滚动：转发鼠标滚轮（携带指针序列锚点坐标）、按键模拟或本地回滚。
+     *
+     * [pointerDownTime] 与 [pointerX]/[pointerY] 是真实指针序列的触点信息，
+     * 仅滚轮转发与序列锚点使用；非指针发起的滚动（如键盘翻页）不得伪造坐标，
+     * 应走本地回滚入口。
+     */
+    fun scrollBy(rowsDown: Int, pointerDownTime: Long, pointerX: Float, pointerY: Float) {
+        val emulator = view.emulator ?: return
+        val up = rowsDown < 0
+        val amount = abs(rowsDown)
+
+        // 在锁外计算鼠标坐标：视口空间只读渲染器字体度量，不触碰模拟器尺寸，无并发竞争
+        val coord = view.viewportCellAt(pointerX, pointerY)
+        var scrollX = coord.col
+        var scrollY = coord.row
+
+        synchronized(emulator) {
+            repeat(amount) {
+                if (emulator.isMouseTrackingActive) {
+                    val button = if (up) TerminalEmulator.MOUSE_WHEELUP_BUTTON else TerminalEmulator.MOUSE_WHEELDOWN_BUTTON
+                    val anchor = anchorScroll(pointerDownTime, scrollX, scrollY)
+                    scrollX = anchor.col
+                    scrollY = anchor.row
+                    emulator.sendMouseEvent(button, scrollX, scrollY, true)
+                } else if (emulator.isAlternateBufferActive) {
+                    view.handleKeyCode(if (up) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN, 0)
+                } else {
+                    view.scrollbackBy(if (up) 1 else -1)
+                    if (!view.awakenScrollbars()) view.invalidate()
+                }
+            }
+        }
+    }
+
+    /** 向终端发送单个鼠标事件代码。 */
+    fun sendMouseEventCode(e: MotionEvent, button: Int, pressed: Boolean) {
+        val emulator = view.emulator ?: return
+        val coord = view.viewportCellAt(e.x, e.y)
+        var x = coord.col
+        var y = coord.row
+
+        synchronized(emulator) {
+            if (pressed && (button == TerminalEmulator.MOUSE_WHEELDOWN_BUTTON || button == TerminalEmulator.MOUSE_WHEELUP_BUTTON)) {
+                val anchor = anchorScroll(e.downTime, x, y)
+                x = anchor.col
+                y = anchor.row
+            }
+            emulator.sendMouseEvent(button, x, y, pressed)
+        }
+    }
+
+    /** 滚动序列锚点：同一 downTime 内复用首触坐标，新序列则以当前坐标重新锚定。 */
+    private fun anchorScroll(downTime: Long, x: Int, y: Int): CursorCoord {
+        if (mouseStartDownTime == downTime) return CursorCoord.pack(mouseScrollStartX, mouseScrollStartY)
+        mouseStartDownTime = downTime
+        mouseScrollStartX = x
+        mouseScrollStartY = y
+        return CursorCoord.pack(x, y)
+    }
+
+    private fun handleMouseEvent(emulator: TerminalEmulator, event: MotionEvent): Boolean {
+        if (event.isButtonPressed(MotionEvent.BUTTON_SECONDARY)) {
+            if (event.action == MotionEvent.ACTION_DOWN) view.showContextMenu()
+            return true
+        }
+
+        if (event.isButtonPressed(MotionEvent.BUTTON_TERTIARY)) {
+            view.pasteTextFromClipboard()
+            return true
+        }
+
+        if (emulator.isMouseTrackingActive) {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_UP -> sendMouseEventCode(
+                    event,
+                    TerminalEmulator.MOUSE_LEFT_BUTTON,
+                    event.action == MotionEvent.ACTION_DOWN
+                )
+                MotionEvent.ACTION_MOVE -> {
+                    // 1003 任意事件模式无条件上报移动；1002 仅在上报按住左键的拖拽移动
+                    if (emulator.isMouseAnyEventTrackingActive ||
+                        (emulator.isMouseButtonEventTrackingActive &&
+                            event.isButtonPressed(MotionEvent.BUTTON_PRIMARY))
+                    ) {
+                        sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true)
+                    }
+                }
+            }
+        }
+        return false
+    }
+}

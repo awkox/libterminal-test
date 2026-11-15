@@ -1,0 +1,570 @@
+package com.awkoo.libterminal.view
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Rect
+import android.graphics.Typeface
+import android.text.InputType
+import android.view.ActionMode
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import com.awkoo.libterminal.color.TerminalColorScheme
+import com.awkoo.libterminal.engine.TerminalEmulator
+import com.awkoo.libterminal.engine.TerminalCursorStyle
+import com.awkoo.libterminal.engine.TerminalSession
+import com.awkoo.libterminal.engine.buffer.CursorCoord
+import com.awkoo.libterminal.view.input.ImeController
+import com.awkoo.libterminal.view.input.InputSource
+import com.awkoo.libterminal.view.input.KeyInputProcessor
+import com.awkoo.libterminal.view.input.TerminalImeConnection
+import com.awkoo.libterminal.view.input.TerminalTouchHandler
+import com.awkoo.libterminal.view.render.TerminalRenderer
+import com.awkoo.libterminal.view.render.TerminalBlinker
+import com.awkoo.libterminal.view.render.TerminalPaletteResolver
+import com.awkoo.libterminal.view.textselection.TextSelectionCursorController
+import com.awkoo.libterminal.view.lifecycle.SessionBinder
+import com.awkoo.libterminal.view.interact.TerminalClipboard
+import com.awkoo.libterminal.view.interact.ActionModeCustomizer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+/** 外部修饰键状态快照，供 [TerminalView.onKeyDown] 消费。 */
+@JvmInline
+value class ExtraKeysModifierSnapshot(val mask: Int) {
+    /** Ctrl 是否粘性按下（mask 位 0）。 */
+    val ctrl: Boolean get() = (mask and 1) != 0
+    /** Alt 是否粘性按下（mask 位 1）。 */
+    val alt: Boolean get() = (mask and 2) != 0
+    /** Shift 是否粘性按下（mask 位 2）。 */
+    val shift: Boolean get() = (mask and 4) != 0
+}
+
+/**
+ * 工厂方法，伪装成原本的构造函数。
+ * 运行时 0 分配，直接编译为底层的整数位运算。
+ */
+inline fun ExtraKeysModifierSnapshot(
+    ctrl: Boolean = false,
+    alt: Boolean = false,
+    shift: Boolean = false
+): ExtraKeysModifierSnapshot = ExtraKeysModifierSnapshot(
+    (if (ctrl) 1 else 0) or
+    (if (alt) 2 else 0) or
+    (if (shift) 4 else 0)
+)
+
+/**
+ * 终端显示与交互的核心 View。
+ *
+ * 作为中心协调器，整合以下组件：
+ * - [TerminalRenderer] 文本渲染
+ * - [TerminalTouchHandler] 触摸 / 鼠标 / 滚动
+ * - [TerminalCursorBlinker] 光标闪烁动画
+ * - [TerminalImeConnection] IME / 软键盘输入
+ * - [TextSelectionCursorController] 文本选择
+ *
+ * 键盘处理（[onKeyDown]、[onKeyUp] 等）因与 View 状态和会话 I/O 紧密耦合，保留在此类中。
+ *
+ * 渲染配色通过 [colorScheme] 属性完全由外部控制：可在运行时修改，
+ * 修改且已绑定会话时立即重建配色。OSC 动态改色仍作为覆盖层生效。
+ */
+class TerminalView(
+    context: Context
+) : View(context) {
+
+    /**
+     * 终端渲染配色的主题基底。
+     *
+     * 可在运行时修改：若已有绑定会话，会立即重建该会话的渲染配色（主题基底 + OSC 覆盖板）。
+     * shell 通过 OSC 动态改色作为覆盖板叠在此基底之上，仍保持生效。
+     */
+    var colorScheme: TerminalColorScheme = TerminalColorScheme.dark()
+        set(value) {
+            if (value == field) return
+            field = value
+            val session = currentSession ?: return
+            applyColorScheme(session)
+            invalidate()
+        }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // 会话事件订阅绑定器：管理屏幕刷新与剪贴板事件流的订阅生命周期
+    private val sessionBinder = SessionBinder(
+        scope = scope,
+        onScreenUpdated = { onScreenUpdated() },
+        onCopiedText = { copyTextToClipboard(it) }
+    )
+
+    internal val touchHandler = TerminalTouchHandler(this)
+
+    // 剪贴板网关：系统剪贴板读写，粘贴时送入模拟器
+    private val clipboard = TerminalClipboard(context, { emulator }, { cursorBlinker.poke() })
+
+    // IME 控制器：软键盘显隐切换
+    private val imeController = ImeController(this)
+
+    // 键盘输入处理器：按键到会话字节流的转换逻辑委托对象
+    private val keyProcessor = KeyInputProcessor(
+        sessionProvider = { currentSession },
+        emulatorProvider = { emulator },
+        pokeCursor = { cursorBlinker.poke() },
+        scrollRows = { rows ->
+            // xterm scroll-back/scroll-forw 口径：翻页是本地回滚动作，不向应用发滚轮事件
+            scrollbackBy(rows)
+            if (!awakenScrollbars()) invalidate()
+        },
+        isSelectingText = { isSelectingText },
+        stopTextSelection = { stopTextSelectionMode() },
+        modifierReader = { extraKeysModifierReader?.invoke() ?: ExtraKeysModifierSnapshot() }
+    )
+
+    private val cursorBlinker = TerminalBlinker(
+        scope = scope,
+        onInvalidate = { invalidate() },
+        shouldStart = { it.isCursorEnabled },
+        setBlinkingEnabled = { emulator, enabled -> emulator.isCursorBlinkingEnabled = enabled },
+        setBlinkState = { emulator, state -> emulator.cursorBlinkState = state }
+    )
+
+    private val textBlinker = TerminalBlinker(
+        scope = scope,
+        onInvalidate = { invalidate() },
+        setBlinkingEnabled = { emulator, enabled -> emulator.isTextBlinkingEnabled = enabled },
+        setBlinkState = { emulator, state -> emulator.textBlinkState = state }
+    )
+
+    /** 当前正在显示的终端会话。 */
+    var currentSession: TerminalSession? = null
+        set(value) {
+            if (value == field) return
+            stopTextSelectionMode()
+            cursorBlinker.stop()
+            textBlinker.stop()
+            sessionBinder.bind(value)
+            scrollbackOffset = 0
+            keyProcessor.reset()
+            field = value
+
+            if (value != null) {
+                applyColorScheme(value)
+                value.emulator.cursorStyle = cursorStyle
+                updateSize()
+                onScreenUpdated()
+                applyBlinker(cursorBlinker, value.emulator, cursorBlinking)
+                applyBlinker(textBlinker, value.emulator, textBlinking)
+            } else {
+                currentPalette = null
+                invalidate()
+            }
+        }
+
+    /**
+     * 依据当前 [colorScheme] 为指定会话重建主题基底与合成调色板。
+     *
+     * OSC 动态改色作为 [TerminalPaletteResolver] 的覆盖板盖在主题之上，仍保持生效。
+     */
+    private fun applyColorScheme(session: TerminalSession) {
+        synchronized(session.emulator) {
+            session.emulator.colorScheme = colorScheme
+        }
+        currentPalette = TerminalPaletteResolver(colorScheme, session.emulator.oscColorOverrides)
+    }
+
+    /**
+     * 当前会话渲染用的合成颜色查询对象（主题基底 + OSC 稀疏覆盖板）。
+     * 绑定会话时构建，主题基底由 [colorScheme] 决定。
+     */
+    private var currentPalette: TerminalPaletteResolver? = null
+
+    internal val emulator: TerminalEmulator?
+        get() = currentSession?.emulator
+
+    /** 终端字号（dp）。setter 自动约束在 1..100，修改后重建渲染器并更新尺寸。 */
+    var textSize: Int = 12
+        set(value) {
+            field = value.coerceIn(1, 100)
+            renderer = TerminalRenderer(field.dp, typeface)
+            updateSize()
+        }
+
+    /** 终端字体。修改后立即重建渲染器并更新尺寸。 */
+    var typeface: Typeface = Typeface.MONOSPACE
+        set(value) {
+            field = value
+            renderer = TerminalRenderer(textSize.dp, field)
+            updateSize()
+            invalidate()
+        }
+
+    internal var renderer = TerminalRenderer(textSize.dp, typeface)
+
+    /** 浮动工具栏定制器，用于本地化按钮文字或添加额外操作。 */
+    var actionModeCustomizer: ActionModeCustomizer? = null
+
+    /**
+     * 终端默认光标样式。
+     *
+     * 设置后立即写入当前模拟器，绑定新会话时也会应用该默认值。
+     * 注意：应用 / Shell 通过 DECSET 序列主动切换的光标形状优先于该默认值，不会被覆盖。
+     */
+    var cursorStyle: TerminalCursorStyle = TerminalCursorStyle.BAR
+        set(value) {
+            if (field == value) return
+            field = value
+            emulator?.cursorStyle = value
+            invalidate()
+        }
+
+    /**
+     * 光标闪烁开关（默认开启）。
+     *
+     * 关闭时立即停止闪烁动画，光标保持常亮；绑定新会话时同样生效。
+     */
+    var cursorBlinking: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            applyBlinker(cursorBlinker, emulator, value)
+        }
+
+    /**
+     * 文本（带闪烁属性）闪烁开关（默认开启）。
+     *
+     * 关闭时立即停止闪烁动画，相关文本保持常亮；绑定新会话时同样生效。
+     */
+    var textBlinking: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            applyBlinker(textBlinker, emulator, value)
+        }
+
+    private fun applyBlinker(blinker: TerminalBlinker, emulator: TerminalEmulator?, enabled: Boolean) {
+        if (enabled) emulator?.let { blinker.start(it) } else blinker.stop()
+    }
+
+    private val textSelectionCursorController = TextSelectionCursorController(this)
+
+    internal val isSelectingText: Boolean
+        get() = textSelectionCursorController.isActive
+
+    private val selectionBoundsScratch: IntArray = intArrayOf(-1, -1, -1, -1)
+
+    internal fun startTextSelectionMode(event: MotionEvent) {
+        if (!requestFocus()) return
+        textSelectionCursorController.show(event)
+        invalidate()
+    }
+
+    /** 手动退出文本选择模式（隐藏选择手柄与浮动工具栏）。 */
+    fun stopTextSelectionMode() {
+        if (textSelectionCursorController.hide()) invalidate()
+    }
+
+    private fun decrementYTextSelectionCursors(decrement: Int) {
+        textSelectionCursorController.shiftSelectionRows(decrement)
+    }
+
+    private val textSelectionActionMode: ActionMode?
+        get() = textSelectionCursorController.actionMode
+
+    private val restoreToolbarAction: Runnable = Runnable {
+        this@TerminalView.textSelectionActionMode?.hide(0)
+    }
+
+    internal fun updateFloatingToolbarVisibility(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_MOVE -> hideFloatingToolbar()
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> showFloatingToolbar()
+        }
+    }
+
+    private fun showFloatingToolbar() {
+        textSelectionActionMode?.let {
+            val delay = ViewConfiguration.getDoubleTapTimeout()
+            postDelayed(restoreToolbarAction, delay.toLong())
+        }
+    }
+
+    private fun hideFloatingToolbar() {
+        textSelectionActionMode?.let {
+            removeCallbacks(restoreToolbarAction)
+            it.hide(-1)
+        }
+    }
+
+    /** 切换自动滚动的禁用状态（配合滚动锁定使用）。 */
+    fun toggleAutoScrollDisabled() {
+        emulator?.toggleAutoScrollDisabled()
+    }
+
+    /** 距屏幕底部的回滚行数，0 表示跟随到底部。 */
+    private var scrollbackOffset: Int = 0
+
+    /** 当前可回滚的最大行数。 */
+    private val maxScrollback: Int
+        get() = emulator?.screen?.activeTranscriptRows ?: 0
+
+    /** 当前顶行的外部行号，恒 ≤ 0；读取时按当前历史行数夹取，始终落在合法域内。 */
+    internal val topRow: Int
+        get() = -scrollbackOffset.coerceIn(0, maxScrollback)
+
+    /** 按行数滚动回滚区：正数向历史（上），负数向底部（下）。 */
+    internal fun scrollbackBy(deltaRows: Int) {
+        scrollbackOffset = (scrollbackOffset + deltaRows).coerceIn(0, maxScrollback)
+    }
+
+    override fun computeVerticalScrollRange() = emulator?.screen?.activeRows ?: 1
+    override fun computeVerticalScrollExtent() = emulator?.rows ?: 1
+    override fun computeVerticalScrollOffset(): Int {
+        val emulator = emulator ?: return 1
+        return emulator.screen.activeRows + this.topRow - emulator.rows
+    }
+
+    private fun onScreenUpdated(skipScrolling: Boolean = false) {
+        val emulator = emulator ?: return
+        var skipScrolling = skipScrolling
+
+        synchronized(emulator) {
+            val rowsInHistory = maxScrollback
+            scrollbackOffset = scrollbackOffset.coerceAtMost(rowsInHistory)
+
+            val rowShift = emulator.takeScrollCounter()
+            if (this.isSelectingText || emulator.isAutoScrollDisabled) {
+                if (scrollbackOffset + rowShift > rowsInHistory) {
+                    if (this.isSelectingText) stopTextSelectionMode()
+                    if (emulator.isAutoScrollDisabled) {
+                        scrollbackOffset = rowsInHistory
+                        skipScrolling = true
+                    }
+                } else {
+                    skipScrolling = true
+                    scrollbackOffset += rowShift
+                    decrementYTextSelectionCursors(rowShift)
+                }
+            }
+        }
+
+        if (!skipScrolling && this.scrollbackOffset != 0) {
+            if (this.scrollbackOffset > 3) awakenScrollBars()
+            this.scrollbackOffset = 0
+        }
+
+        invalidate()
+    }
+
+    /**
+     * 视口像素 → 视口行列，不夹取。
+     *
+     * 合法范围由鼠标协议编码器在上报前裁决，避免在锁外读取模拟器尺寸。
+     */
+    internal fun viewportCellAt(x: Float, y: Float): CursorCoord {
+        val renderer = renderer
+        return CursorCoord.pack(
+            CellPoint.xToColumn(x, renderer.fontWidth),
+            CellPoint.yToRow(y, renderer.fontLineSpacing, renderer.baselineOffset)
+        )
+    }
+
+    /**
+     * 视口像素 → 缓冲区行列（含回滚历史）。
+     *
+     * 选区与手柄坐标必须落在缓冲区合法域内，夹取以缓冲区为唯一真源统一收口。
+     */
+    internal fun bufferCellAt(x: Float, y: Float): CursorCoord {
+        val renderer = renderer
+        val column = CellPoint.xToColumn(x, renderer.fontWidth)
+        val row = CellPoint.yToRow(y, renderer.fontLineSpacing, renderer.baselineOffset) + topRow
+        val emulator = emulator ?: return CursorCoord.pack(column, row)
+        val screen = emulator.screen
+        return CursorCoord.pack(screen.clampColumn(column), screen.clampRow(row))
+    }
+
+    /** 单元格列 → 像素边界；末列之后的右边界传 `columns`。 */
+    internal fun getPointX(cx: Int): Int {
+        val columns = emulator?.columns ?: 0
+        val clamped = if (columns == 0) cx else cx.coerceAtMost(columns)
+        return CellPoint.columnToX(clamped, renderer.fontWidth)
+    }
+
+    internal fun getPointY(cy: Int) = CellPoint.rowToY(cy - topRow, renderer.fontLineSpacing)
+
+    internal fun copyTextToClipboard() {
+        copyTextToClipboard(textSelectionCursorController.selectedText)
+    }
+
+    internal fun copyTextToClipboard(text: String) = clipboard.copyText(text)
+
+    /** 将系统剪贴板文本粘贴到终端。 */
+    fun pasteTextFromClipboard() = clipboard.pasteFromClipboard()
+
+    internal fun awakenScrollbars(): Boolean = awakenScrollBars()
+
+    override fun onTouchEvent(event: MotionEvent) = touchHandler.onTouchEvent(event)
+
+    override fun onGenericMotionEvent(event: MotionEvent) = touchHandler.onGenericMotionEvent(event)
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return TerminalImeConnection(this)
+    }
+
+    override fun onCheckIsTextEditor() = true
+
+    /** 切换/强制软键盘显隐：true 显示、false 隐藏、null 取反。 */
+    fun toggleIme(show: Boolean? = null) = imeController.toggleIme(show)
+
+    /** 隐藏软键盘（不请求焦点），供覆盖层（如设置页）打开时收起键盘。 */
+    fun hideIme() = imeController.hideIme()
+
+    /**
+     * 外部修饰键状态读取器（如来自屏幕扩展按键栏）。
+     * 设置后，[onKeyDown] 会同时参考 [KeyEvent] 元状态和此读取器，
+     * 使粘性修饰键也作用于物理键盘输入。
+     */
+    var extraKeysModifierReader: (() -> ExtraKeysModifierSnapshot)? = null
+
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && this.isSelectingText) {
+            stopTextSelectionMode()
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        return when (keyProcessor.onKeyDown(keyCode, event)) {
+            KeyInputProcessor.KeyDownResult.HANDLED -> true
+            KeyInputProcessor.KeyDownResult.NOT_HANDLED -> false
+            KeyInputProcessor.KeyDownResult.PASS_TO_SUPER -> super.onKeyDown(keyCode, event)
+        }
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (emulator == null && keyCode != KeyEvent.KEYCODE_BACK) return true
+        if (event.isSystem) return super.onKeyUp(keyCode, event)
+        return true
+    }
+
+    /**
+     * 将虚拟 / 扩展按键栏产生的 Unicode 码点注入终端。
+     *
+     * 与 [android.view.KeyEvent] 注入不同，此入口专供应用自建的扩展按键栏使用；
+     * 内部固定为虚拟来源，调用方无需感知来源标识。
+     */
+    fun inputVirtualKeyCodePoint(
+        codePoint: Int,
+        controlDownFromEvent: Boolean = false,
+        leftAltDownFromEvent: Boolean = false
+    ) =
+        inputCodePoint(
+            InputSource.VIRTUAL_KEY_BAR,
+            codePoint,
+            controlDownFromEvent,
+            leftAltDownFromEvent
+        )
+
+    internal fun inputCodePoint(
+        source: InputSource,
+        codePoint: Int,
+        controlDownFromEvent: Boolean,
+        leftAltDownFromEvent: Boolean
+    ) = keyProcessor.inputCodePoint(source, codePoint, controlDownFromEvent, leftAltDownFromEvent)
+
+    internal fun handleKeyCode(keyCode: Int, keyMod: Int): Boolean = keyProcessor.handleKeyCode(keyCode, keyMod)
+
+    override fun isOpaque() = true
+
+    override fun onDraw(canvas: Canvas) {
+        val emulator = emulator ?: return
+        val resolver = currentPalette ?: return
+        canvas.drawColor(resolver.background)
+        val sel = selectionBoundsScratch
+        textSelectionCursorController.getSelectors(sel)
+        synchronized(emulator) {
+            renderer.render(emulator, resolver, canvas, this.topRow, sel[0], sel[1], sel[2], sel[3])
+        }
+        textSelectionCursorController.render()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        updateSize()
+    }
+
+    private fun updateSize() {
+        val currentSession = currentSession ?: return
+        val emulator = currentSession.emulator
+        val viewWidth = width
+        val viewHeight = height
+        if (viewWidth == 0 || viewHeight == 0) return
+
+        val newColumns = max(4, (viewWidth / renderer.fontWidth).toInt())
+        val newRows = max(4, (viewHeight - renderer.baselineOffset) / renderer.fontLineSpacing)
+
+        if (newColumns != emulator.columns || newRows != emulator.rows) {
+            currentSession.updateSize(newColumns, newRows, renderer.fontWidth.toInt(), renderer.fontLineSpacing)
+            scrollbackOffset = 0
+            scrollTo(0, 0)
+            invalidate()
+        }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        emulator?.onWindowFocusChanged(hasWindowFocus)
+
+        // 当窗口失去焦点时，自动关闭文本选择
+        if (!hasWindowFocus && isSelectingText) {
+            stopTextSelectionMode()
+        }
+    }
+
+    // 当 View 自身失去焦点时，自动关闭文本选择
+    override fun onFocusChanged(
+        gainFocus: Boolean,
+        direction: Int,
+        previouslyFocusedRect: Rect?
+    ) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        if (!gainFocus && isSelectingText) {
+            stopTextSelectionMode()
+        }
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        viewTreeObserver.addOnTouchModeChangeListener(textSelectionCursorController)
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        currentSession = null
+        viewTreeObserver.removeOnTouchModeChangeListener(textSelectionCursorController)
+        scope.coroutineContext.cancelChildren()
+    }
+
+    /** 释放协程与触摸模式监听，解绑当前会话；View 从窗口分离时必须调用。 */
+    fun dispose() {
+        currentSession = null
+        viewTreeObserver.removeOnTouchModeChangeListener(textSelectionCursorController)
+        scope.cancel() 
+    }
+
+    init {
+        isVerticalScrollBarEnabled = true
+    }
+
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).roundToInt().and(-2)
+}
