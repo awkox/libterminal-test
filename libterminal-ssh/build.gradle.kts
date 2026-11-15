@@ -4,7 +4,6 @@ plugins {
 
 android {
     namespace = "com.awkoo.libterminal.ssh"
-    ndkVersion = "29.0.14206865"
 
     compileSdk {
         version = release(37)
@@ -12,13 +11,6 @@ android {
 
     defaultConfig {
         minSdk = 28
-    }
-
-    externalNativeBuild {
-        cmake {
-            path(file("src/main/cpp/CMakeLists.txt"))
-            version = "4.1.2"
-        }
     }
 }
 

@@ -27,7 +27,12 @@ class SshFactory(
 ) : ITerminalProcess {
 
     companion object {
-        init { System.loadLibrary("sshterm") }
+        private val nativeLoaded: Boolean = try {
+            System.loadLibrary("sshterm")
+            true
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        }
 
         @JvmStatic
         private external fun sshConnect(
@@ -68,6 +73,7 @@ class SshFactory(
 
     override var inputStream: InputStream
     override var outputStream: OutputStream
+    private var _failureReason: String? = null
 
     init {
         val socketPair = ParcelFileDescriptor.createSocketPair()
@@ -75,17 +81,23 @@ class SshFactory(
         inputStream = FileInputStream(socketPair[0].fileDescriptor)
         outputStream = FileOutputStream(socketPair[0].fileDescriptor)
 
-        val connFd = socketPair[1].detachFd()
-        val (password, keyPath, keyPassphrase) = when (val auth = info.auth) {
-            is SshAuth.Password -> Triple(auth.password, null, null)
-            is SshAuth.PrivateKey -> Triple(null, auth.path, auth.passphrase)
+        if (!nativeLoaded) {
+            try { socketPair[1].close() } catch (_: Exception) {}
+            _failureReason = "SSH native library unavailable (missing mbedtls/libssh submodules)"
+            handle = 0
+        } else {
+            val connFd = socketPair[1].detachFd()
+            val (password, keyPath, keyPassphrase) = when (val auth = info.auth) {
+                is SshAuth.Password -> Triple(auth.password, null, null)
+                is SshAuth.PrivateKey -> Triple(null, auth.path, auth.passphrase)
+            }
+            handle = sshConnect(
+                info.host, info.port, info.user,
+                password, keyPath, keyPassphrase,
+                info.hostKeyFingerprint,
+                info.timeoutMs, connFd, rows, columns
+            )
         }
-        handle = sshConnect(
-            info.host, info.port, info.user,
-            password, keyPath, keyPassphrase,
-            info.hostKeyFingerprint,
-            info.timeoutMs, connFd, rows, columns
-        )
     }
 
     override fun resize(columns: Int, rows: Int, cellWidthPixels: Int, cellHeightPixels: Int) {
@@ -107,8 +119,6 @@ class SshFactory(
         }
         return code
     }
-
-    private var _failureReason: String? = null
 
     /** 非正常退出原因（认证失败/连接中断等）；正常退出或本地进程为 null。 */
     override val failureReason: String?

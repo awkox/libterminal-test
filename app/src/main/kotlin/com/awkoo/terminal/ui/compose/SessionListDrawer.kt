@@ -46,9 +46,11 @@ import com.awkoo.libterminal.color.TerminalColorScheme
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 
-/** 终端字体按进程缓存：应用 resources 资产进程内不变，避免 TerminalView 重建时反复从 assets 加载。 */
+/** 终端字体按进程缓存：优先加载 assets 中的字体文件，缺失时回落到系统等宽字体。 */
 private object TerminalTypefaceCache {
-    private val FONT_ASSET = "font/maplemononl_nf_cn_regular.otf"
+    private const val FONT_DIR = "font"
+    private const val FONT_FILE = "maplemononl_nf_cn_regular.otf"
+    private const val FONT_ASSET = "$FONT_DIR/$FONT_FILE"
 
     @Volatile
     private var cached: Typeface? = null
@@ -56,10 +58,17 @@ private object TerminalTypefaceCache {
     fun get(context: Context): Typeface {
         cached?.let { return it }
         return synchronized(this) {
-            cached ?: Typeface.createFromAsset(
-                context.applicationContext.assets,
-                FONT_ASSET
-            ).also { cached = it }
+            cached ?: loadOrDefault(context.applicationContext).also { cached = it }
+        }
+    }
+
+    private fun loadOrDefault(context: Context): Typeface {
+        val assets = context.assets
+        val hasFontAsset = assets.list(FONT_DIR)?.contains(FONT_FILE) == true
+        return if (hasFontAsset) {
+            Typeface.createFromAsset(assets, FONT_ASSET)
+        } else {
+            Typeface.MONOSPACE
         }
     }
 }

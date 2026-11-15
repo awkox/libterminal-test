@@ -23,11 +23,11 @@ android {
     }
 
     signingConfigs {
-        getByName("debug") {
-            storeFile = file("testkey_untrusted.jks")
-            keyAlias = "alias"
-            storePassword = "xrj45yWGLbsO7W0v"
-            keyPassword = "xrj45yWGLbsO7W0v"
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
         register("release") {
             storeFile = file("release.keystore")
@@ -51,7 +51,7 @@ android {
 
         debug {
             applicationIdSuffix = ".debug"
-            signingConfig = signingConfigs["debug"]
+            signingConfig = signingConfigs.getByName("debugConfig")
         }
     }
 

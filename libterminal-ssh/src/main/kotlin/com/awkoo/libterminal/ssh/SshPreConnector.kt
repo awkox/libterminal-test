@@ -26,7 +26,12 @@ interface SshPreConnector {
 /** [SshPreConnector] 的 native 实现。 */
 object SshInspector : SshPreConnector {
 
-    init { System.loadLibrary("sshterm") }
+    private val nativeLoaded: Boolean = try {
+        System.loadLibrary("sshterm")
+        true
+    } catch (_: UnsatisfiedLinkError) {
+        false
+    }
 
     @JvmStatic
     private external fun sshTryLoadKey(path: String, passphrase: String?): String?
@@ -39,10 +44,12 @@ object SshInspector : SshPreConnector {
     ): String
 
     override fun checkPrivateKey(path: String, passphrase: String?): String? {
+        if (!nativeLoaded) return "SSH native library unavailable (missing mbedtls/libssh submodules)"
         return sshTryLoadKey(path, passphrase)
     }
 
     override fun serverFingerprint(host: String, port: Int, timeoutMs: Int): String {
+        if (!nativeLoaded) return "ERROR: SSH native library unavailable (missing mbedtls/libssh submodules)"
         return sshGetServerFingerprint(host, port, timeoutMs)
     }
 }
